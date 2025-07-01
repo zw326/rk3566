@@ -4,11 +4,18 @@
 
 // 包含Rockit相关头文件
 extern "C" {
+#include "rk_debug.h"
 #include "rk_common.h"
 #include "rk_comm_video.h"
 #include "rk_comm_vdec.h"
 #include "rk_comm_vo.h"
-#include "rk_mpi.h"
+#include "rk_comm_sys.h" // [新增] 为SYS_Bind提供结构体
+#include "rk_comm_mb.h"   // [新增] 为MB_BLK提供结构体
+
+#include "rk_mpi_vdec.h" // [新增] VDEC模块API
+#include "rk_mpi_vo.h"   // [新增] VO模块API
+#include "rk_mpi_sys.h"  // [新增] 系统控制模块API（Bind, CreateMB等）
+#include "rk_mpi_mb.h"   // [新增] 内存块模块API
 }
 
 // 视频状态码定义
@@ -59,20 +66,12 @@ bool EncodedVideoFrameHandler::Initialize(int width, int height, const std::stri
     height_ = height;
     codec_type_ = codec_type;
     
-    // 初始化Rockit解码器
-    if (!InitializeDecoder()) {
-        std::cerr << "Failed to initialize decoder" << std::endl;
-        return false;
-    }
-    
-    // 初始化Rockit显示输出
-    if (!InitializeDisplay()) {
-        std::cerr << "Failed to initialize display" << std::endl;
-        return false;
-    }
-    
+
     is_initialized_ = true;
-    NotifyVideoState(VIDEO_STATE_INITIALIZED, "Video handler initialized");
+    is_decoder_ready_ = false; // 确保解码器和显示初始为未就绪
+    is_display_ready_ = false;
+
+    NotifyVideoState(VIDEO_STATE_INITIALIZED, "Video handler initialized, waiting for first frame.");
     return true;
 }
 
@@ -127,27 +126,47 @@ void EncodedVideoFrameHandler::Reset() {
     NotifyVideoState(VIDEO_STATE_SYNC_RESET, "Video sync reset");
 }
 
-webrtc::Result EncodedVideoFrameHandler::OnEncodedImage(
+webrtc::EncodedImageCallback::Result EncodedVideoFrameHandler::OnEncodedImage(
     const webrtc::EncodedImage& encoded_image,
     const webrtc::CodecSpecificInfo* codec_specific_info) {
     
     if (!is_running_) {
-        return webrtc::Result(webrtc::Result::OK, "Handler not running");
+        // 成功，但告知WebRTC我们不处理（虽然这里实际上不会发生）
+        return webrtc::EncodedImageCallback::Result(webrtc::EncodedImageCallback::Result::OK, encoded_image.RtpTimestamp());
     }
     
+    // 【核心修改】检查解码器和显示是否已就绪
+    if (!is_decoder_ready_ || !is_display_ready_) {
+        // 从视频帧中获取真实的分辨率
+        width_ = encoded_image._encodedWidth;
+        height_ = encoded_image._encodedHeight;
+        std::cout << "First frame received. Dyanmic resolution: " 
+                  << width_ << "x" << height_ << std::endl;
+
+        // 使用真实分辨率初始化解码器和显示
+        if (!InitializeDecoder()) {
+            std::cerr << "Failed to initialize decoder with dynamic resolution" << std::endl;
+            return webrtc::EncodedImageCallback::Result(webrtc::EncodedImageCallback::Result::ERROR_SEND_FAILED, encoded_image.RtpTimestamp());
+        }
+        if (!InitializeDisplay()) {
+            std::cerr << "Failed to initialize display with dynamic resolution" << std::endl;
+            return webrtc::EncodedImageCallback::Result(webrtc::EncodedImageCallback::Result::ERROR_SEND_FAILED, encoded_image.RtpTimestamp());
+        }
+    }
     // 获取编码数据
     const uint8_t* data = encoded_image.data();
     size_t size = encoded_image.size();
-    int64_t capture_time_ms = encoded_image.capture_time_ms_;
+    // [修正3] 在新版API中，ntp_time_ms_ 和 capture_time_ms_ 都需要从 presentation_timestamp 中获取
+    int64_t capture_time_ms = encoded_image.PresentationTimestamp().value_or(webrtc::Timestamp::MinusInfinity()).ms();
     bool is_key_frame = encoded_image._frameType == webrtc::VideoFrameType::kVideoFrameKey;
     
     // 解码并显示帧
     if (!DecodeAndDisplayFrame(data, size, capture_time_ms, is_key_frame)) {
         std::cerr << "Failed to decode and display frame" << std::endl;
-        return webrtc::Result(webrtc::Result::ERROR, "Failed to decode frame");
+        return webrtc::EncodedImageCallback::Result(webrtc::EncodedImageCallback::Result::ERROR_SEND_FAILED, encoded_image.RtpTimestamp());
     }
     
-    return webrtc::Result(webrtc::Result::OK);
+    return webrtc::EncodedImageCallback::Result(webrtc::EncodedImageCallback::Result::OK, encoded_image.RtpTimestamp());
 }
 
 bool EncodedVideoFrameHandler::InitializeDecoder() {
@@ -157,9 +176,9 @@ bool EncodedVideoFrameHandler::InitializeDecoder() {
     
     // 设置解码器类型
     if (codec_type_ == "H264") {
-        vdec_attr.enCodecType = RK_CODEC_TYPE_H264;
+        vdec_attr.enType = RK_VIDEO_ID_AVC;
     } else if (codec_type_ == "H265") {
-        vdec_attr.enCodecType = RK_CODEC_TYPE_H265;
+        vdec_attr.enType = RK_VIDEO_ID_HEVC;
     } else {
         std::cerr << "Unsupported codec type: " << codec_type_ << std::endl;
         return false;
@@ -194,51 +213,81 @@ bool EncodedVideoFrameHandler::InitializeDecoder() {
 }
 
 bool EncodedVideoFrameHandler::InitializeDisplay() {
-    // 配置显示输出参数
-    VO_CHN_ATTR_S vo_attr;
-    memset(&vo_attr, 0, sizeof(VO_CHN_ATTR_S));
-    
-    // 设置显示区域
-    vo_attr.pcDevNode = "/dev/dri/card0";  // DRM设备节点
-    vo_attr.u32Width = width_;
-    vo_attr.u32Height = height_;
-    vo_attr.stImgRect.s32X = 0;
-    vo_attr.stImgRect.s32Y = 0;
-    vo_attr.stImgRect.u32Width = width_;
-    vo_attr.stImgRect.u32Height = height_;
-    vo_attr.stDispRect.s32X = 0;
-    vo_attr.stDispRect.s32Y = 0;
-    vo_attr.stDispRect.u32Width = width_;
-    vo_attr.stDispRect.u32Height = height_;
-    
-    // 创建显示通道
-    int ret = RK_MPI_VO_CreateChn(0, vo_chn_, &vo_attr);
+    // 定义要使用的VO设备和图层。对于RK356x，通常使用设备0（如HDMI）和图层0（主视频层）
+    VO_DEV VoDev = 0;
+    VO_LAYER VoLayer = 0; 
+    // 在绑定模式下，VO通道通常也用0
+    vo_chn_ = 0; 
+
+    // 1. 配置并启用显示设备 (Device)
+    VO_PUB_ATTR_S stVoPubAttr;
+    memset(&stVoPubAttr, 0, sizeof(stVoPubAttr));
+    // 设置接口类型，例如HDMI
+    stVoPubAttr.enIntfType = VO_INTF_HDMI;
+    // 设置时序/分辨率，例如1080P@60Hz
+    stVoPubAttr.enIntfSync = VO_OUTPUT_1080P60; 
+
+    int ret = RK_MPI_VO_SetPubAttr(VoDev, &stVoPubAttr);
     if (ret != RK_SUCCESS) {
-        std::cerr << "Failed to create VO channel: " << ret << std::endl;
+        RK_LOGE("Failed to set VO public attributes, error code: %#x", ret);
         return false;
     }
-    
-    // 绑定解码器和显示输出
-    MPP_CHN_S src_chn;
-    src_chn.enModId = RK_ID_VDEC;
-    src_chn.s32DevId = 0;
-    src_chn.s32ChnId = vdec_chn_;
-    
-    MPP_CHN_S dst_chn;
-    dst_chn.enModId = RK_ID_VO;
-    dst_chn.s32DevId = 0;
-    dst_chn.s32ChnId = vo_chn_;
-    
-    ret = RK_MPI_SYS_Bind(&src_chn, &dst_chn);
+
+    ret = RK_MPI_VO_Enable(VoDev);
     if (ret != RK_SUCCESS) {
-        std::cerr << "Failed to bind VDEC and VO: " << ret << std::endl;
-        RK_MPI_VO_DestroyChn(0, vo_chn_);
+        RK_LOGE("Failed to enable VO device, error code: %#x", ret);
+        return false;
+    }
+
+    // 2. 配置并启用视频图层 (Layer)
+    VO_VIDEO_LAYER_ATTR_S stLayerAttr;
+    memset(&stLayerAttr, 0, sizeof(stLayerAttr));
+    // 设置图层的显示区域和画布大小，应与视频分辨率一致
+    stLayerAttr.stDispRect = {0, 0, static_cast<RK_U32>(width_), static_cast<RK_U32>(height_)};
+    stLayerAttr.stImageSize = {static_cast<RK_U32>(width_), static_cast<RK_U32>(height_)};
+    // 设置图层期望接收的像素格式，应与VDEC解码输出的格式一致
+    stLayerAttr.enPixFormat = RK_FMT_YUV420SP; 
+    stLayerAttr.u32DispFrmRt = 60; // 设置显示帧率
+
+    ret = RK_MPI_VO_SetLayerAttr(VoLayer, &stLayerAttr);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to set VO layer attributes, error code: %#x", ret);
+        RK_MPI_VO_Disable(VoDev); // 清理已启用的设备
+        return false;
+    }
+
+    ret = RK_MPI_VO_EnableLayer(VoLayer);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to enable VO layer, error code: %#x", ret);
+        RK_MPI_VO_Disable(VoDev); // 清理已启用的设备
+        return false;
+    }
+
+    // 3. 将VDEC通道绑定到VO图层上，实现零拷贝
+    MPP_CHN_S stSrcChn; // 数据源：VDEC
+    stSrcChn.enModId = RK_ID_VDEC;
+    stSrcChn.s32DevId = 0; // VDEC设备ID通常为0
+    stSrcChn.s32ChnId = vdec_chn_;
+
+    MPP_CHN_S stDestChn; // 目标：VO
+    stDestChn.enModId = RK_ID_VO;
+    stDestChn.s32DevId = VoLayer; // 在VO模块中，设备ID常被用来指代图层ID
+    stDestChn.s32ChnId = vo_chn_;
+
+    ret = RK_MPI_SYS_Bind(&stSrcChn, &stDestChn);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to bind VDEC and VO, error code: %#x", ret);
+        // 清理已启用的图层和设备
+        RK_MPI_VO_DisableLayer(VoLayer);
+        RK_MPI_VO_Enable(VoDev);
         return false;
     }
     
     is_display_ready_ = true;
-    std::cout << "Display initialized successfully" << std::endl;
+    std::cout << "Display initialized and bound to VDEC successfully." << std::endl;
     return true;
+
+
 }
 
 bool EncodedVideoFrameHandler::DecodeAndDisplayFrame(
@@ -248,40 +297,59 @@ bool EncodedVideoFrameHandler::DecodeAndDisplayFrame(
         std::cerr << "Decoder or display not ready" << std::endl;
         return false;
     }
-    
-    // 创建视频帧
-    VIDEO_FRAME_INFO_S video_frame;
-    memset(&video_frame, 0, sizeof(VIDEO_FRAME_INFO_S));
-    
-    // 分配内存块
-    MB_BLK mb = RK_MPI_MB_CreateBuffer(encoded_size, false);
-    if (!mb) {
-        std::cerr << "Failed to create memory block" << std::endl;
+
+    // 1. 使用 C 标准库的 malloc 申请内存
+    void* buffer_data = malloc(encoded_size);
+    if (!buffer_data) {
+        std::cerr << "Failed to malloc buffer for encoded data" << std::endl;
         return false;
     }
-    
-    // 复制编码数据
-    void* mb_data = RK_MPI_MB_GetPtr(mb);
-    memcpy(mb_data, encoded_data, encoded_size);
-    
-    // 设置视频帧参数
-    video_frame.stVFrame.pMbBlk = mb;
-    video_frame.stVFrame.u32Width = width_;
-    video_frame.stVFrame.u32Height = height_;
-    video_frame.stVFrame.u32VirWidth = width_;
-    video_frame.stVFrame.u32VirHeight = height_;
-    video_frame.stVFrame.enPixelFormat = RK_FMT_YUV420SP;
-    video_frame.stVFrame.u64PTS = pts;
-    
-    // 发送帧到解码器
-    int ret = RK_MPI_VDEC_SendFrame(vdec_chn_, &video_frame, -1);
-    RK_MPI_MB_ReleaseBuffer(mb);
-    
+    memcpy(buffer_data, encoded_data, encoded_size);
+
+    // 2. 准备用户数据和回调函数，用于内存的自动释放
+    UserData* userData = new UserData();
+    userData->buffer = buffer_data;
+
+    MB_EXT_CONFIG_S stMbExtConfig;
+    memset(&stMbExtConfig, 0, sizeof(MB_EXT_CONFIG_S));
+    stMbExtConfig.pFreeCB = FreeCallback;    // 设置释放回调函数
+    stMbExtConfig.pOpaque = userData;        // 传递用户数据指针
+    stMbExtConfig.pu8VirAddr = (RK_U8*)buffer_data;
+    stMbExtConfig.u64Size = encoded_size;
+
+    // 3. 使用 RK_MPI_SYS_CreateMB 将我们自己的内存“包装”成一个 MB_BLK 句柄
+    MB_BLK mb_handle = RK_NULL;
+    int ret = RK_MPI_SYS_CreateMB(&mb_handle, &stMbExtConfig);
     if (ret != RK_SUCCESS) {
-        std::cerr << "Failed to send frame to decoder: " << ret << std::endl;
-        NotifyVideoState(VIDEO_STATE_DECODER_ERROR, "Failed to send frame to decoder");
+        std::cerr << "Failed to create MB from external buffer, error: " << ret << std::endl;
+        free(buffer_data);
+        delete userData;
         return false;
     }
+
+    // 4. 配置 VDEC_STREAM_S
+    VDEC_STREAM_S stStream;
+    memset(&stStream, 0, sizeof(VDEC_STREAM_S));
+    stStream.pMbBlk = mb_handle;
+    stStream.u32Len = encoded_size;
+    stStream.u64PTS = pts;
+    stStream.bEndOfStream = RK_FALSE;
+    stStream.bEndOfFrame = RK_TRUE;
+    stStream.bBypassMbBlk = RK_TRUE; // 【核心】设置为 TRUE，启用直通模式
+
+    // 5. 发送码流给解码器
+    ret = RK_MPI_VDEC_SendStream(vdec_chn_, &stStream, -1);
+    if (ret != RK_SUCCESS) {
+        std::cerr << "Failed to send stream to decoder in bypass mode: " << ret << std::endl;
+        // 如果发送失败，MPI不会接管内存，我们需要自己释放
+        RK_MPI_MB_ReleaseMB(mb_handle); // ReleaseMB会触发回调
+        return false;
+    }
+
+    // 6. 释放 MB_BLK 句柄
+    //    注意：这里只释放句柄，真正的内存(buffer_data)所有权已经移交给MPI，
+    //    将在MPI内部使用完毕后，通过我们设置的 FreeCallback 函数来释放。
+    RK_MPI_MB_ReleaseMB(mb_handle);
     
     // 处理同步
     int64_t current_time = GetCurrentTimeMs();
@@ -321,4 +389,10 @@ void EncodedVideoFrameHandler::NotifyVideoState(int state, const std::string& me
     if (video_state_callback_) {
         video_state_callback_(state, message);
     }
+}
+
+void EncodedVideoFrameHandler::OnDroppedFrame(DropReason reason) {
+    // 暂时只打印日志，表示我们知道有帧被丢弃了
+    // 注意：DropReason 是一个枚举，不能直接用 << 打印，需要转成整数
+    std::cerr << "A video frame has been dropped, reason code: " << static_cast<int>(reason) << std::endl;
 }

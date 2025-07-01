@@ -16,10 +16,7 @@
  */
 class WebSocketSignalingClient : public SignalingClient {
 public:
-    //构造函数
     WebSocketSignalingClient();
-
-    //析构函数
     ~WebSocketSignalingClient() override;
 
     // SignalingClient接口实现
@@ -43,7 +40,7 @@ private:
      */
     struct Message {
         MessageType type;
-        std::string content;
+        Json::Value content; // 直接存储JSON对象，而非字符串std::string content;
         std::string target_id;
     };
 
@@ -78,8 +75,8 @@ private:
      * @param target_id 目标客户端ID（可选）
      * @return 是否成功发送
      */
-    bool SendMessage(MessageType type, const std::string& content, const std::string& target_id = "");
-
+    bool SendMessage(MessageType type, const Json::Value& content, const std::string& target_id = "");
+    
     /**
      * @brief 处理接收到的消息
      * @param message 消息内容
@@ -142,7 +139,7 @@ private:
     // 房间和客户端信息
     std::string room_id_;
     std::string client_id_;
-    std::mutex info_mutex_;
+    mutable std::mutex info_mutex_; // 标记为mutable以便在const方法中加锁
 
     // 回调函数
     StateCallback state_callback_;

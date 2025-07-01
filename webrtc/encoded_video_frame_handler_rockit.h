@@ -1,8 +1,8 @@
 #pragma once
-
-#include "api/video_codecs/encoded_image.h"
-#include "api/video/encoded_image_callback.h"
-#include "api/video_codecs/video_decoder.h"
+#include "rk_type.h"
+#include "api/video/encoded_image.h"      // 为了使用 EncodedImage 这个“包裹”类
+#include "api/video_codecs/video_encoder.h" // 为了使用 EncodedImageCallback 这个“回调”接口
+#include "api/video_codecs/video_decoder.h" // 为了使用 VideoDecoder 相关类型
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -79,10 +79,27 @@ public:
     void SetVideoStateCallback(VideoStateCallback callback) { video_state_callback_ = std::move(callback); }
 
     // 实现EncodedImageCallback接口
-    webrtc::Result OnEncodedImage(const webrtc::EncodedImage& encoded_image,
-                                 const webrtc::CodecSpecificInfo* codec_specific_info) override;
-
+    webrtc::EncodedImageCallback::Result OnEncodedImage(
+        const webrtc::EncodedImage& encoded_image,
+        const webrtc::CodecSpecificInfo* codec_specific_info) override;
+    void OnDroppedFrame(DropReason reason) override;
 private:
+    // 用于传递给回调函数的用户数据
+    struct UserData {
+        void* buffer;
+    };
+
+    // C风格的静态回调函数，用于释放内存
+    static RK_S32 FreeCallback(void* opaque) {
+        if (opaque) {
+            UserData* userData = static_cast<UserData*>(opaque);
+            free(userData->buffer); // 释放最初malloc的内存
+            delete userData;        // 释放结构体本身
+            return RK_SUCCESS;
+        }
+        return RK_FAILURE;
+    }
+        
     /**
      * @brief 初始化Rockit解码器
      * @return 是否初始化成功

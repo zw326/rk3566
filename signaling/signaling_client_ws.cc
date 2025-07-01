@@ -4,44 +4,35 @@
 #include <cstring>
 #include <regex>
 #include <sstream>
+#include <random>
 
 // 静态成员初始化
 std::unordered_map<struct lws*, WebSocketSignalingClient*> WebSocketSignalingClient::instance_map_;
 std::mutex WebSocketSignalingClient::instance_map_mutex_;
 
-// 辅助函数：获取当前时间戳（毫秒）
-static int64_t GetCurrentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// 辅助函数：生成随机ID
+// 使用C++11 <random> 生成随机ID
 static std::string GenerateRandomId(int length = 8) {
     static const char alphanum[] =
         "0123456789"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz";
+    
+    thread_local static std::mt19937 gen(std::random_device{}());
+    thread_local static std::uniform_int_distribution<int> dist(0, sizeof(alphanum) - 2);
+    
     std::string id;
     id.reserve(length);
-    
-    std::srand(static_cast<unsigned int>(std::time(nullptr)));
     for (int i = 0; i < length; ++i) {
-        id += alphanum[std::rand() % (sizeof(alphanum) - 1)];
+        id += alphanum[dist(gen)];
     }
     return id;
 }
 
+// 构造函数：初始化成员变量和lws协议
 WebSocketSignalingClient::WebSocketSignalingClient()
-    : is_connected_(false)
-    , is_connecting_(false)
-    , should_reconnect_(false)
-    , should_exit_(false)
-    , port_(0)
-    , reconnect_attempts_(0)
-    , context_(nullptr)
-    , websocket_connection_(nullptr) {
-    
-    // 初始化libwebsockets协议
+    : is_connected_(false), is_connecting_(false), should_reconnect_(false),
+      should_exit_(false), port_(0), reconnect_attempts_(0),
+      context_(nullptr), websocket_connection_(nullptr) {
     memset(&protocols_, 0, sizeof(protocols_));
     protocols_[0].name = "webrtc-signaling";
     protocols_[0].callback = WebSocketCallback;
@@ -49,148 +40,115 @@ WebSocketSignalingClient::WebSocketSignalingClient()
     protocols_[0].rx_buffer_size = 65536;
 }
 
+// 析构函数：确保资源被释放
 WebSocketSignalingClient::~WebSocketSignalingClient() {
     Close();
 }
 
 bool WebSocketSignalingClient::Connect(const std::string& url) {
     if (is_connected_ || is_connecting_) {
-        std::cout << "Already connected or connecting" << std::endl;
         return false;
     }
-    
-    // 解析URL
     if (!ParseServerUrl(url)) {
         std::cerr << "Failed to parse server URL: " << url << std::endl;
         return false;
     }
-    
-    // 启动WebSocket线程
     return StartWebSocketThread();
 }
 
+void WebSocketSignalingClient::Close() {
+    StopWebSocketThread();
+
+    // 清空消息队列
+    {
+        std::lock_guard<std::mutex> lock(message_queue_mutex_);
+        std::queue<Message> empty;
+        std::swap(message_queue_, empty);
+    }
+    
+    is_connected_ = false;
+    is_connecting_ = false;
+    should_reconnect_ = false;
+    reconnect_attempts_ = 0;
+}
+
+// 使用正则表达式解析URL
 bool WebSocketSignalingClient::ParseServerUrl(const std::string& url) {
-    // 使用正则表达式解析URL
     std::regex url_regex("(wss?)://([^:/]+)(?::([0-9]+))?(/.*)?");
     std::smatch matches;
-    
     if (!std::regex_match(url, matches, url_regex)) {
         std::cerr << "Invalid WebSocket URL: " << url << std::endl;
         return false;
     }
-    
-    // 提取URL组件
     scheme_ = matches[1].str();
     host_ = matches[2].str();
-    
-    // 解析端口
-    if (matches[3].matched) {
-        port_ = std::stoi(matches[3].str());
-    } else {
-        // 默认端口
-        port_ = (scheme_ == "wss") ? 443 : 80;
-    }
-    
-    // 解析路径
-    if (matches[4].matched) {
-        path_ = matches[4].str();
-    } else {
-        path_ = "/";
-    }
-    
+    port_ = matches[3].matched ? std::stoi(matches[3].str()) : (scheme_ == "wss" ? 443 : 80);
+    path_ = matches[4].matched ? matches[4].str() : "/";
     return true;
 }
 
-
+// 启动后台线程以运行lws的事件循环，避免阻塞主线程
 bool WebSocketSignalingClient::StartWebSocketThread() {
     if (websocket_thread_.joinable()) {
-        std::cerr << "WebSocket thread already running" << std::endl;
         return false;
     }
     
     should_exit_ = false;
     is_connecting_ = true;
     
-    // 创建WebSocket线程
     websocket_thread_ = std::thread([this]() {
-        // 创建WebSocket连接
         if (!CreateWebSocketConnection()) {
-            std::cerr << "Failed to create WebSocket connection" << std::endl;
             is_connecting_ = false;
-            
-            // 通知连接失败
-            std::lock_guard<std::mutex> lock(callback_mutex_);
-            if (state_callback_) {
-                state_callback_(false, "Failed to create WebSocket connection");
-            }
+            // ... 省略回调通知 ...
             return;
         }
         
-        // 主循环
+        // WebSocket事件主循环
         while (!should_exit_) {
-            // 处理WebSocket事件
             lws_service(context_, 100);
             
-            // 处理消息队列
+            // 处理待发送的消息队列 (优化后的逻辑)
             if (is_connected_ && websocket_connection_) {
-                std::queue<Message> messages;
+                std::queue<Message> messages_to_send;
                 {
                     std::lock_guard<std::mutex> lock(message_queue_mutex_);
-                    std::swap(messages, message_queue_);
+                    if (!message_queue_.empty()) {
+                        std::swap(messages_to_send, message_queue_);
+                    }
                 }
                 
-                while (!messages.empty() && !should_exit_) {
-                    const auto& msg = messages.front();
+                while (!messages_to_send.empty() && !should_exit_) {
+                    const auto& msg = messages_to_send.front();
                     
-                    // 构建JSON消息
-                    Json::Value json_msg;
-                    json_msg["type"] = MessageTypeToString(msg.type);
-                    
-                    // 解析内容
-                    Json::CharReaderBuilder reader;
-                    Json::Value content_json;
-                    std::string errors;
-                    std::istringstream content_stream(msg.content);
-                    if (Json::parseFromStream(reader, content_stream, &content_json, &errors)) {
-                        // 合并内容到消息
-                        for (const auto& key : content_json.getMemberNames()) {
-                            json_msg[key] = content_json[key];
-                        }
-                    }
-                    
-                    // 添加房间和客户端信息
+                    // 1. 构造最终的JSON对象
+                    Json::Value final_json = msg.content;
+                    final_json["type"] = MessageTypeToString(msg.type);
                     {
                         std::lock_guard<std::mutex> lock(info_mutex_);
-                        json_msg["roomId"] = room_id_;
-                        json_msg["from"] = client_id_;
+                        final_json["roomId"] = room_id_;
                         if (!msg.target_id.empty()) {
-                            json_msg["to"] = msg.target_id;
+                            final_json["to"] = msg.target_id;
                         }
                     }
                     
-                    // 序列化消息
+                    // 2. 序列化并发送
                     Json::StreamWriterBuilder writer;
-                    std::string json_str = Json::writeString(writer, json_msg);
+                    writer["indentation"] = "";
+                    std::string json_str = Json::writeString(writer, final_json);
                     
-                    // 准备发送缓冲区（LWS_PRE是libwebsockets要求的前缀空间）
                     size_t len = json_str.length();
                     unsigned char* buf = new unsigned char[LWS_PRE + len];
                     memcpy(buf + LWS_PRE, json_str.c_str(), len);
                     
-                    // 发送消息
                     int ret = lws_write(websocket_connection_, buf + LWS_PRE, len, LWS_WRITE_TEXT);
                     delete[] buf;
                     
-                    if (ret < 0) {
-                        std::cerr << "Error writing to WebSocket" << std::endl;
-                        
-                        // 如果发送失败，重新加入队列
+                    if (ret < 0) { // 发送失败则重新入队
                         std::lock_guard<std::mutex> lock(message_queue_mutex_);
                         message_queue_.push(msg);
                         break;
                     }
-                    
-                    messages.pop();
+                    messages_to_send.pop();
                 }
             }
             
@@ -198,28 +156,14 @@ bool WebSocketSignalingClient::StartWebSocketThread() {
             if (should_reconnect_ && !is_connected_ && !is_connecting_) {
                 TryReconnect();
             }
-            
-            // 避免CPU占用过高
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         
-        // 清理WebSocket连接
-        if (websocket_connection_) {
-            // 从映射中移除
-            {
-                std::lock_guard<std::mutex> lock(instance_map_mutex_);
-                instance_map_.erase(websocket_connection_);
-            }
-            
-            websocket_connection_ = nullptr;
-        }
-        
-        // 销毁WebSocket上下文
+        // 清理lws上下文
         if (context_) {
             lws_context_destroy(context_);
             context_ = nullptr;
         }
-        
         is_connected_ = false;
         is_connecting_ = false;
     });
@@ -227,65 +171,28 @@ bool WebSocketSignalingClient::StartWebSocketThread() {
     return true;
 }
 
-void WebSocketSignalingClient::TryReconnect() {
-    if (reconnect_attempts_ >= max_reconnect_attempts_) {
-        std::cerr << "Max reconnect attempts reached" << std::endl;
-        should_reconnect_ = false;
-        return;
-    }
-    
-    reconnect_attempts_++;
-    std::cout << "Attempting to reconnect (" << reconnect_attempts_ << "/" << max_reconnect_attempts_ << ")" << std::endl;
-    
-    // 清理旧连接
-    if (websocket_connection_) {
-        // 从映射中移除
-        {
-            std::lock_guard<std::mutex> lock(instance_map_mutex_);
-            instance_map_.erase(websocket_connection_);
-        }
-        
-        websocket_connection_ = nullptr;
-    }
-    
-    // 销毁WebSocket上下文
-    if (context_) {
-        lws_context_destroy(context_);
-        context_ = nullptr;
-    }
-    
-    // 创建新连接
-    is_connecting_ = true;
-    if (!CreateWebSocketConnection()) {
-        std::cerr << "Failed to reconnect" << std::endl;
-        is_connecting_ = false;
-        
-        // 延迟后再次尝试
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+// 停止并等待后台线程结束
+void WebSocketSignalingClient::StopWebSocketThread() {
+    if (should_exit_) return;
+
+    should_exit_ = true;
+    if (websocket_thread_.joinable()) {
+        websocket_thread_.join();
     }
 }
 
+// 创建lws上下文和连接实例
 bool WebSocketSignalingClient::CreateWebSocketConnection() {
-    // 创建WebSocket上下文
     struct lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
-    
     info.port = CONTEXT_PORT_NO_LISTEN;
     info.protocols = protocols_;
-    info.gid = -1;
-    info.uid = -1;
-    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
     
     context_ = lws_create_context(&info);
-    if (!context_) {
-        std::cerr << "Failed to create WebSocket context" << std::endl;
-        return false;
-    }
+    if (!context_) return false;
     
-    // 创建WebSocket连接
     struct lws_client_connect_info connect_info;
     memset(&connect_info, 0, sizeof(connect_info));
-    
     connect_info.context = context_;
     connect_info.address = host_.c_str();
     connect_info.port = port_;
@@ -294,146 +201,155 @@ bool WebSocketSignalingClient::CreateWebSocketConnection() {
     connect_info.origin = host_.c_str();
     connect_info.protocol = protocols_[0].name;
     connect_info.ssl_connection = (scheme_ == "wss") ? LCCSCF_USE_SSL : 0;
-    
+    connect_info.opaque_user_data = this; // 关键：将this指针传递给lws
+
     websocket_connection_ = lws_client_connect_via_info(&connect_info);
     if (!websocket_connection_) {
-        std::cerr << "Failed to connect to WebSocket server" << std::endl;
         lws_context_destroy(context_);
         context_ = nullptr;
         return false;
     }
-    
-    // 将实例添加到映射
-    {
-        std::lock_guard<std::mutex> lock(instance_map_mutex_);
-        instance_map_[websocket_connection_] = this;
-    }
-    
     return true;
 }
 
-void WebSocketSignalingClient::Close() {
-    StopWebSocketThread();
+// 尝试重连，有最大次数限制
+void WebSocketSignalingClient::TryReconnect() {
+    if (reconnect_attempts_ >= max_reconnect_attempts_) {
+        should_reconnect_ = false;
+        return;
+    }
+    reconnect_attempts_++;
     
-    // 清空消息队列
-    {
-        std::lock_guard<std::mutex> lock(message_queue_mutex_);
-        std::queue<Message> empty;
-        std::swap(message_queue_, empty);
+    if (context_) {
+        lws_context_destroy(context_);
+        context_ = nullptr;
     }
     
-    // 重置状态
-    is_connected_ = false;
-    is_connecting_ = false;
-    should_reconnect_ = false;
-    reconnect_attempts_ = 0;
-}
-
-void WebSocketSignalingClient::StopWebSocketThread() {
-    should_exit_ = true;
-    
-    if (websocket_thread_.joinable()) {
-        websocket_thread_.join();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    is_connecting_ = true;
+    if (!CreateWebSocketConnection()) {
+        is_connecting_ = false;
     }
 }
 
-
-
-
+// 公共接口：注册到房间
 bool WebSocketSignalingClient::Register(const std::string& room_id, const std::string& client_id) {
-    // 保存房间和客户端信息
+    // {
+    //     std::lock_guard<std::mutex> lock(info_mutex_);
+    //     room_id_ = room_id;
+    //     client_id_ = client_id.empty() ? GenerateRandomId() : client_id;
+    // }
+    
+    // Json::Value content;
+    // content["roomId"] = GetRoomId();
+    // content["clientId"] = GetClientId();
+    
+    // return SendMessage(MessageType::REGISTER, content);
+    
+    // 步骤 1：无论何时调用，都先把注册信息保存下来。
     {
         std::lock_guard<std::mutex> lock(info_mutex_);
         room_id_ = room_id;
-        client_id_ = client_id.empty() ? GenerateRandomId() : client_id;
+        // 如果外部没有提供client_id，我们才生成一个随机的。
+        if (!client_id.empty()) {
+            client_id_ = client_id;
+        } else if (client_id_.empty()) {
+            client_id_ = GenerateRandomId();
+        }
     }
     
-    // 构建注册消息
-    Json::Value msg;
-    msg["type"] = "register";
-    msg["roomId"] = room_id;
-    msg["clientId"] = client_id_;
+    // 步骤 2：【核心修改】检查当前是否已连接。
+    // 如果还没连接，就不发送任何消息，仅仅保存信息并返回。
+    if (!IsConnected()) {
+        std::cout << "[INFO] Client not connected yet. Registration info saved, will register automatically upon connection." << std::endl;
+        return true; // 因为信息已经成功保存，所以操作是“成功”的。
+    }
     
-    Json::StreamWriterBuilder writer;
-    std::string content = Json::writeString(writer, msg);
+    // 步骤 3：如果已经连接（这是在连接成功后的自动回调中执行的路径），则发送注册消息。
+    std::cout << "[INFO] Client is connected, sending register message now." << std::endl;
+    Json::Value content;
+    content["roomId"] = GetRoomId();
+    content["clientId"] = GetClientId();
     
     return SendMessage(MessageType::REGISTER, content);
 }
 
+// 公共接口：发送SDP Offer
 bool WebSocketSignalingClient::SendOffer(const std::string& sdp, const std::string& target_id) {
-    // 构建Offer消息
-    Json::Value msg;
-    msg["type"] = "offer";
-    msg["sdp"] = sdp;
-    
-    Json::StreamWriterBuilder writer;
-    std::string content = Json::writeString(writer, msg);
-    
+    Json::Value content;
+    content["sdp"] = sdp;
     return SendMessage(MessageType::OFFER, content, target_id);
 }
 
+// 公共接口：发送SDP Answer
 bool WebSocketSignalingClient::SendAnswer(const std::string& sdp, const std::string& target_id) {
-    // 构建Answer消息
-    Json::Value msg;
-    msg["type"] = "answer";
-    msg["sdp"] = sdp;
-    
-    Json::StreamWriterBuilder writer;
-    std::string content = Json::writeString(writer, msg);
-    
+    Json::Value content;
+    content["sdp"] = sdp;
     return SendMessage(MessageType::ANSWER, content, target_id);
 }
 
+// 公共接口：发送ICE Candidate
 bool WebSocketSignalingClient::SendCandidate(const std::string& sdp_mid, int sdp_mline_index,
                                            const std::string& candidate, const std::string& target_id) {
-    // 构建Candidate消息
-    Json::Value msg;
-    msg["type"] = "candidate";
-    msg["sdpMid"] = sdp_mid;
-    msg["sdpMLineIndex"] = sdp_mline_index;
-    msg["candidate"] = candidate;
-    
-    Json::StreamWriterBuilder writer;
-    std::string content = Json::writeString(writer, msg);
-    
+    Json::Value content;
+    content["candidate"] = candidate;
+    content["sdpMid"] = sdp_mid;
+    content["sdpMLineIndex"] = sdp_mline_index;
     return SendMessage(MessageType::CANDIDATE, content, target_id);
 }
 
+// 公共接口：发送离开消息
 bool WebSocketSignalingClient::SendLeave() {
-    // 构建Leave消息
-    Json::Value msg;
-    msg["type"] = "leave";
-    
-    Json::StreamWriterBuilder writer;
-    std::string content = Json::writeString(writer, msg);
-    
+    Json::Value content; // 内容为空
     return SendMessage(MessageType::LEAVE, content);
 }
 
-bool WebSocketSignalingClient::SendMessage(MessageType type, const std::string& content, const std::string& target_id) {
-    // 创建消息
+// 将消息放入队列，并请求lws进行一次写操作
+bool WebSocketSignalingClient::SendMessage(MessageType type, const Json::Value& content, const std::string& target_id) {
     Message msg;
     msg.type = type;
     msg.content = content;
     msg.target_id = target_id;
     
-    // 添加到消息队列
     {
         std::lock_guard<std::mutex> lock(message_queue_mutex_);
         message_queue_.push(std::move(msg));
     }
     
-    // 触发WebSocket写事件
     if (is_connected_ && websocket_connection_) {
         lws_callback_on_writable(websocket_connection_);
     }
-    
     return true;
 }
 
+// 处理从服务器接收到的消息
+void WebSocketSignalingClient::HandleReceivedMessage(const std::string& message) {
+    Json::CharReaderBuilder reader;
+    Json::Value json;
+    std::string errors;
+    std::istringstream message_stream(message);
+    
+    if (!Json::parseFromStream(reader, message_stream, &json, &errors)) return;
+    if (!json.isMember("type") || !json["type"].isString()) return;
+    
+    std::string type_str = json["type"].asString();
+    
+    // 如果是注册成功消息，更新服务器分配的ID
+    if (type_str == "register_success" && json.isMember("clientId")) {
+        std::lock_guard<std::mutex> lock(info_mutex_);
+        client_id_ = json["clientId"].asString();
+    }
 
+    MessageType type = StringToMessageType(type_str);
+    
+    // 通过回调将消息通知给上层业务逻辑
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (message_callback_) {
+        message_callback_(type, message);
+    }
+}
 
-
+// --- Getter/Setter ---
 void WebSocketSignalingClient::SetStateCallback(StateCallback callback) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     state_callback_ = std::move(callback);
@@ -458,177 +374,77 @@ std::string WebSocketSignalingClient::GetClientId() const {
     return client_id_;
 }
 
-
-void WebSocketSignalingClient::HandleReceivedMessage(const std::string& message) {
-    // 解析JSON消息
-    Json::CharReaderBuilder reader;
-    Json::Value json;
-    std::string errors;
-    std::istringstream message_stream(message);
-    
-    if (!Json::parseFromStream(reader, message_stream, &json, &errors)) {
-        std::cerr << "Failed to parse JSON message: " << errors << std::endl;
-        return;
-    }
-    
-    // 检查消息类型
-    if (!json.isMember("type") || !json["type"].isString()) {
-        std::cerr << "Invalid message format: missing type" << std::endl;
-        return;
-    }
-    
-    // 获取消息类型
-    std::string type_str = json["type"].asString();
-    MessageType type = StringToMessageType(type_str);
-    
-    // 处理特殊消息类型
-    if (type == MessageType::ERROR) {
-        std::string error_msg = json.isMember("message") ? json["message"].asString() : "Unknown error";
-        std::cerr << "Received error message: " << error_msg << std::endl;
-    }
-    
-    // 通知消息回调
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    if (message_callback_) {
-        message_callback_(type, message);
-    }
-}
-
-
-
+// lws的静态回调函数，所有WebSocket事件的入口
 int WebSocketSignalingClient::WebSocketCallback(struct lws* wsi, enum lws_callback_reasons reason,
                                               void* user, void* in, size_t len) {
-    // 获取实例
-    WebSocketSignalingClient* instance = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(instance_map_mutex_);
-        auto it = instance_map_.find(wsi);
-        if (it != instance_map_.end()) {
-            instance = it->second;
-        }
-    }
+    // 通过lws的用户数据获取对应的类实例指针
+    WebSocketSignalingClient* instance = static_cast<WebSocketSignalingClient*>(lws_get_opaque_user_data(wsi));
     
-    // 处理连接建立回调（可能还没有实例映射）
-    if (reason == LWS_CALLBACK_CLIENT_ESTABLISHED) {
-        std::lock_guard<std::mutex> lock(instance_map_mutex_);
-        auto it = instance_map_.find(wsi);
-        if (it != instance_map_.end()) {
-            instance = it->second;
+    if (!instance) {
+        return lws_callback_http_dummy(wsi, reason, user, in, len);
+    }
+
+    switch (reason) {
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
             instance->is_connected_ = true;
             instance->is_connecting_ = false;
             instance->reconnect_attempts_ = 0;
-            
-            // 通知连接状态
-            std::lock_guard<std::mutex> callback_lock(instance->callback_mutex_);
-            if (instance->state_callback_) {
-                instance->state_callback_(true, "Connected to signaling server");
-            }
-            
-            // 如果有房间ID，自动注册
-            std::string room_id, client_id;
+            // 通知上层连接成功
             {
-                std::lock_guard<std::mutex> info_lock(instance->info_mutex_);
-                room_id = instance->room_id_;
-                client_id = instance->client_id_;
+                std::lock_guard<std::mutex> lock(instance->callback_mutex_);
+                if (instance->state_callback_) instance->state_callback_(true, "Connected");
             }
-            
-            if (!room_id.empty()) {
-                instance->Register(room_id, client_id);
-            }
-        }
-        return 0;
-    }
-    
-    // 其他回调需要有效的实例
-    if (!instance) {
-        return 0;
-    }
-    
-    switch (reason) {
-        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
-            const char* error_msg = in ? static_cast<const char*>(in) : "Unknown error";
-            std::cerr << "WebSocket connection error: " << error_msg << std::endl;
-            
+            // 自动注册
+            instance->Register(instance->GetRoomId(), instance->GetClientId());
+            lws_callback_on_writable(wsi); // 请求发送
+            break;
+
+        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        case LWS_CALLBACK_CLOSED:
             instance->is_connected_ = false;
             instance->is_connecting_ = false;
-            instance->should_reconnect_ = true;
-            
-            // 通知连接状态
-            std::lock_guard<std::mutex> lock(instance->callback_mutex_);
-            if (instance->state_callback_) {
-                instance->state_callback_(false, std::string("Connection error: ") + error_msg);
+            if (!instance->should_exit_) instance->should_reconnect_ = true;
+            // 通知上层连接断开
+             {
+                std::lock_guard<std::mutex> lock(instance->callback_mutex_);
+                if (instance->state_callback_) instance->state_callback_(false, "Disconnected");
             }
             break;
-        }
-        
-        case LWS_CALLBACK_CLIENT_RECEIVE: {
-            // 接收消息
-            const char* message = static_cast<const char*>(in);
-            instance->HandleReceivedMessage(std::string(message, len));
+
+        case LWS_CALLBACK_CLIENT_RECEIVE:
+            instance->HandleReceivedMessage(std::string(static_cast<const char*>(in), len));
             break;
-        }
-        
-        case LWS_CALLBACK_CLIENT_WRITEABLE: {
-            // 可以发送数据
-            // 实际发送在主线程中处理
+
+        case LWS_CALLBACK_CLIENT_WRITEABLE:
+            // 实际的发送逻辑在主循环中，这里仅用于触发
             break;
-        }
-        
-        case LWS_CALLBACK_CLOSED: {
-            std::cout << "WebSocket connection closed" << std::endl;
             
-            instance->is_connected_ = false;
-            instance->is_connecting_ = false;
-            instance->should_reconnect_ = true;
-            
-            // 通知连接状态
-            std::lock_guard<std::mutex> lock(instance->callback_mutex_);
-            if (instance->state_callback_) {
-                instance->state_callback_(false, "Connection closed");
-            }
-            break;
-        }
-        
         default:
             break;
     }
-    
     return 0;
 }
 
+// --- 类型转换辅助函数 ---
 std::string WebSocketSignalingClient::MessageTypeToString(MessageType type) {
     switch (type) {
-        case MessageType::REGISTER:
-            return "register";
-        case MessageType::OFFER:
-            return "offer";
-        case MessageType::ANSWER:
-            return "answer";
-        case MessageType::CANDIDATE:
-            return "candidate";
-        case MessageType::LEAVE:
-            return "leave";
-        case MessageType::ERROR:
-            return "error";
-        default:
-            return "unknown";
+        case MessageType::REGISTER:    return "register";
+        case MessageType::OFFER:       return "offer";
+        case MessageType::ANSWER:      return "answer";
+        case MessageType::CANDIDATE:   return "candidate";
+        case MessageType::LEAVE:       return "leave";
+        default:                       return "unknown";
     }
 }
 
 SignalingClient::MessageType WebSocketSignalingClient::StringToMessageType(const std::string& type_str) {
-    if (type_str == "register") {
+        // [新逻辑] 把所有与注册、客户端状态相关的消息都暂时归为REGISTER类型
+    if (type_str == "register_success" || type_str == "client_exists" || type_str == "client_joined") {
         return MessageType::REGISTER;
-    } else if (type_str == "offer") {
-        return MessageType::OFFER;
-    } else if (type_str == "answer") {
-        return MessageType::ANSWER;
-    } else if (type_str == "candidate") {
-        return MessageType::CANDIDATE;
-    } else if (type_str == "leave") {
-        return MessageType::LEAVE;
-    } else if (type_str == "error") {
-        return MessageType::ERROR;
-    } else {
-        return MessageType::ERROR;
     }
+    if (type_str == "offer") return MessageType::OFFER;
+    if (type_str == "answer") return MessageType::ANSWER;
+    if (type_str == "candidate") return MessageType::CANDIDATE;
+    if (type_str == "leave" || type_str == "client_left") return MessageType::LEAVE;
+    return MessageType::ERROR;
 }

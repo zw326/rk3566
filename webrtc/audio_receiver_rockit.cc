@@ -7,10 +7,12 @@
 
 // 包含Rockit相关头文件
 extern "C" {
+#include "rk_debug.h"
 #include "rk_common.h"
-#include "rk_comm_aio.h"
-#include "rk_comm_ao.h"
-#include "rk_mpi.h"
+#include "rk_comm_aio.h" // [新增] 为AIO提供结构体
+#include "rk_mpi_ao.h"   // [新增] AO模块API
+#include "rk_mpi_mb.h"   // [新增] 内存块模块API
+#include "rk_mpi_sys.h"
 }
 
 // 音频状态码定义
@@ -205,36 +207,52 @@ void AudioReceiver::OnData(const void* audio_data,
 }
 
 bool AudioReceiver::InitializeAudioDevice() {
-    // 配置音频输出参数
-    AUDIO_DEV AoDev = 0;
+    // 定义要使用的AO设备和通道
+    AUDIO_DEV AoDev = 0; // 假设使用设备0 (例如板载声卡或HDMI音频)
     AO_CHN AoChn = 0;
-    AO_CHN_ATTR_S stAoAttr;
     
-    memset(&stAoAttr, 0, sizeof(AO_CHN_ATTR_S));
+    // 1. 配置音频设备公共属性 (AIO_ATTR_S)
+    AIO_ATTR_S stAoAttr;
+    memset(&stAoAttr, 0, sizeof(AIO_ATTR_S));
+
+    // a. 设置将要发送给AO的数据的属性
+    stAoAttr.enSamplerate = (AUDIO_SAMPLE_RATE_E)sample_rate_;
+    stAoAttr.enBitwidth = (bits_per_sample_ == 16) ? AUDIO_BIT_WIDTH_16 : AUDIO_BIT_WIDTH_24;
+    stAoAttr.enSoundmode = (channels_ == 1) ? AUDIO_SOUND_MODE_MONO : AUDIO_SOUND_MODE_STEREO;
     
-    // 设置音频参数
-    stAoAttr.enSampleFormat = (bits_per_sample_ == 16) ? RK_SAMPLE_FMT_S16 : RK_SAMPLE_FMT_S32;
-    stAoAttr.u32Channels = channels_;
-    stAoAttr.u32SampleRate = sample_rate_;
-    stAoAttr.u32NbSamples = 1024;  // 每帧采样点数
+    // b. 设置物理声卡(Sound Card)本身的参数。这里通常设置为与输入数据一致，
+    //    如果声卡不支持，可以开启重采样(ReSample)功能让MPI在内部转换。
+    stAoAttr.soundCard.channels = channels_;
+    stAoAttr.soundCard.sampleRate = (AUDIO_SAMPLE_RATE_E)sample_rate_;
+    stAoAttr.soundCard.bitWidth = (bits_per_sample_ == 16) ? AUDIO_BIT_WIDTH_16 : AUDIO_BIT_WIDTH_24;
+
+    // c. 设置帧参数
+    stAoAttr.u32PtNumPerFrm = 1024; // 每帧的采样点数，这是一个常用值
     
-    // 创建音频输出设备
-    int ret = RK_MPI_AO_SetChnAttr(AoDev, AoChn, &stAoAttr);
+    int ret = RK_MPI_AO_SetPubAttr(AoDev, &stAoAttr);
     if (ret != RK_SUCCESS) {
-        std::cerr << "Failed to set audio output attributes: " << ret << std::endl;
+        RK_LOGE("Failed to set AO public attributes, error code: %#x", ret);
+        return false;
+    }
+
+    // 2. 启用音频设备
+    ret = RK_MPI_AO_Enable(AoDev);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to enable AO device, error code: %#x", ret);
         return false;
     }
     
-    // 启用音频输出通道
+    // 3. 启用音频输出通道
     ret = RK_MPI_AO_EnableChn(AoDev, AoChn);
     if (ret != RK_SUCCESS) {
-        std::cerr << "Failed to enable audio output channel: " << ret << std::endl;
+        RK_LOGE("Failed to enable AO channel, error code: %#x", ret);
+        RK_MPI_AO_Disable(AoDev); // 清理已启用的设备
         return false;
     }
-    
+
     audio_device_id_ = AoDev;
     is_device_working_ = true;
-    std::cout << "Audio device initialized successfully" << std::endl;
+    std::cout << "Audio device initialized successfully." << std::endl;
     return true;
 }
 
@@ -295,29 +313,41 @@ bool AudioReceiver::SendAudioFrameToDevice(const AudioFrame& frame) {
     // 设置音频参数
     audio_frame.u32Len = frame.size;
     audio_frame.u64TimeStamp = frame.pts;
-    audio_frame.enSampleFormat = (frame.bits_per_sample == 16) ? RK_SAMPLE_FMT_S16 : RK_SAMPLE_FMT_S32;
-    audio_frame.u32Channels = frame.channels;
-    audio_frame.u32SampleRate = frame.sample_rate;
-    audio_frame.u32Samples = frame.number_of_frames;
+    audio_frame.enBitWidth = (frame.bits_per_sample == 16) ? AUDIO_BIT_WIDTH_16 : AUDIO_BIT_WIDTH_24;
+    audio_frame.enSoundMode = (frame.channels == 1) ? AUDIO_SOUND_MODE_MONO : AUDIO_SOUND_MODE_STEREO;
+    // 注意：SampleRate 和 SamplesPerFrame 是在配置设备(SetPubAttr)时设置的，而不是在每帧数据中传递。
     
     // 分配内存块
-    MB_BLK mb = RK_MPI_MB_CreateBuffer(frame.size, false);
-    if (!mb) {
-        std::cerr << "Failed to create memory block for audio frame" << std::endl;
+    MB_BLK mb = RK_NULL;
+    int ret = RK_MPI_SYS_Malloc(&mb, frame.size);
+    if (ret != RK_SUCCESS || mb == RK_NULL) {
+        std::cerr << "Failed to malloc memory block for audio frame, ret: " << ret << std::endl;
+        return false;
+    }
+
+    // 3. [修正] 使用 RK_MPI_MB_Handle2VirAddr 获取虚拟地址
+    void* mb_data = RK_MPI_MB_Handle2VirAddr(mb);
+    if (!mb_data) {
+        std::cerr << "Failed to get virtual address from MB_BLK" << std::endl;
+        RK_MPI_SYS_Free(mb); // 释放已申请的内存
         return false;
     }
     
     // 复制音频数据
-    void* mb_data = RK_MPI_MB_GetPtr(mb);
     memcpy(mb_data, frame.data.get(), frame.size);
     audio_frame.pMbBlk = mb;
     
     // 发送音频帧到设备
-    int ret = RK_MPI_AO_SendFrame(audio_device_id_, 0, &audio_frame, -1);
+    ret = RK_MPI_AO_SendFrame(audio_device_id_, 0, &audio_frame, -1);
     if (ret != RK_SUCCESS) {
-        RK_MPI_MB_ReleaseBuffer(mb);
+        // 如果发送失败，MPI不会接管内存，我们需要自己释放
+        std::cerr << "Failed to send audio frame to device, ret: " << ret << std::endl;
+        RK_MPI_SYS_Free(mb);
         return false;
     }
+
+    // 发送成功后，MPI会管理这块内存的生命周期，我们不需要在这里释放
+    // RK_MPI_SYS_Free(mb); // 这行是错误的，发送成功后不能立即释放
     
     return true;
 }

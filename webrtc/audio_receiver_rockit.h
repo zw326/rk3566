@@ -3,7 +3,9 @@
 #include "api/media_stream_interface.h"
 #include "api/audio/audio_frame.h"
 #include "rtc_base/thread.h"
+#include "absl/types/optional.h"
 #include <mutex>
+#include <thread>
 #include <queue>
 #include <memory>
 #include <atomic>
@@ -161,7 +163,7 @@ private:
 
     // 音频缓冲队列
     std::queue<AudioFrame> audio_buffer_;
-    std::mutex buffer_mutex_;
+    mutable std::mutex buffer_mutex_;
     size_t max_buffer_size_;  // 最大缓冲帧数
 
     // 音频设备
@@ -174,7 +176,7 @@ private:
     std::atomic<bool> is_paused_;
 
     // 音视频同步
-    std::mutex sync_mutex_;
+    mutable std::mutex sync_mutex_;
     int64_t video_reference_pts_;
     int64_t video_reference_time_;
     int target_delay_ms_;
